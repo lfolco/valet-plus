@@ -22,7 +22,7 @@ use Symfony\Component\Console\Question\Question;
 Container::setInstance(new Container);
 
 // get current version based on git describe and tags
-$version = new Version('1.0.26' , __DIR__ . '/../');
+$version = new Version('1.0.29' , __DIR__ . '/../');
 
 $app = new Application('Valet+', $version->getVersion());
 
@@ -49,7 +49,7 @@ $app->command('install [--with-mariadb]', function ($withMariadb) {
     Binaries::installBinaries();
 
     Configuration::install();
-    Nginx::install();
+    $domain = Nginx::install();
     PhpFpm::install();
     DnsMasq::install();
     Mysql::install($withMariadb ? 'mariadb' : 'mysql@5.7');
@@ -58,6 +58,9 @@ $app->command('install [--with-mariadb]', function ($withMariadb) {
     Nginx::restart();
     Valet::symlinkToUsersBin();
     Mysql::setRootPassword();
+
+    Mailhog::updateDomain($domain);
+    Elasticsearch::updateDomain($domain);
 
     output(PHP_EOL.'<info>Valet installed successfully!</info>');
 })->descriptions('Install the Valet services');
@@ -85,6 +88,9 @@ if (is_dir(VALET_HOME_PATH)) {
         if ($domain === null) {
             return info(Configuration::read()['domain']);
         }
+
+        Mailhog::updateDomain($domain);
+        Elasticsearch::updateDomain($domain);
 
         DnsMasq::updateDomain(
             $oldDomain = Configuration::read()['domain'], $domain = trim($domain, '.')
@@ -277,9 +283,23 @@ if (is_dir(VALET_HOME_PATH)) {
      * Start the daemon services.
      */
     $app->command('start [services]*', function ($services) {
-        if(empty($services)) {
+        $phpVersion = false;
+
+        if (!empty($services)) {
+            // Check if services contains a php version so we can switch to it immediately.
+            $phpVersions = array_keys(\Valet\PhpFpm::SUPPORTED_PHP_FORMULAE);
+            $intersect   = array_intersect($services, $phpVersions);
+            $phpVersion  = end($intersect);
+            $services    = array_diff($services, $phpVersions);
+        }
+
+        if (empty($services)) {
             DnsMasq::restart();
-            PhpFpm::restart();
+            if ($phpVersion) {
+                PhpFpm::switchTo($phpVersion);
+            } else {
+                PhpFpm::restart();
+            }
             Nginx::restart();
             Mysql::restart();
             RedisTool::restart();
@@ -288,6 +308,7 @@ if (is_dir(VALET_HOME_PATH)) {
             RabbitMq::restart();
             Varnish::restart();
             info('Valet services have been started.');
+
             return;
         }
 
@@ -303,7 +324,11 @@ if (is_dir(VALET_HOME_PATH)) {
                     break;
                 }
                 case 'php': {
-                    PhpFpm::restart();
+                    if ($phpVersion) {
+                        PhpFpm::switchTo($phpVersion);
+                    } else {
+                        PhpFpm::restart();
+                    }
                     break;
                 }
                 case 'redis': {
@@ -479,11 +504,31 @@ if (is_dir(VALET_HOME_PATH)) {
     })->descriptions('Determine if this is the latest version of Valet');
 
     /**
-     * Switch between versions of PHP
+     * Switch between versions of PHP (Default) or Elasticsearch
      */
-    $app->command('use [phpVersion]', function ($phpVersion) {
-        PhpFpm::switchTo($phpVersion);
-    })->descriptions('Switch between versions of PHP');
+    $app->command('use [service] [targetVersion]', function ($service, $targetVersion) {
+        $supportedServices = [
+            'php'           => 'php',
+            'elasticsearch' => 'elasticsearch',
+            'es'            => 'elasticsearch',
+        ];
+        if (is_numeric($service)) {
+            $targetVersion = $service;
+            $service       = 'php';
+        }
+        $service = (isset($supportedServices[$service]) ? $supportedServices[$service] : false);
+
+        switch ($service) {
+            case 'php':
+                PhpFpm::switchTo($targetVersion);
+                break;
+            case 'elasticsearch':
+                Elasticsearch::switchTo($targetVersion);
+                break;
+            default:
+                throw new Exception('Service to switch version of not supported. Supported services: ' . implode(', ', array_unique(array_values($supportedServices))));
+        }
+    })->descriptions('Switch between versions of PHP (default) or Elasticsearch');
 
     /**
      * Create database
@@ -792,6 +837,31 @@ if (is_dir(VALET_HOME_PATH)) {
                 return;
         }
     })->descriptions('Enable / disable Redis');
+
+    $app->command('memcache [mode]', function ($mode) {
+        $modes = ['install', 'uninstall'];
+
+        if (!in_array($mode, $modes)) {
+            throw new Exception('Mode not found. Available modes: '.implode(', ', $modes));
+        }
+
+        if (PhpFpm::linkedPhp() == '5.6') {
+            throw new Exception('Memcache needs php 7.0 or higher, current php version: 5.6');
+        }
+
+        $restart = false;
+        switch ($mode) {
+            case 'install':
+                $restart = Memcache::install();
+                break;
+            case 'uninstall':
+                $restart = Memcache::uninstall();
+                break;
+        }
+        if ($restart) {
+          PhpFpm::restart();
+        }
+    })->descriptions('Install / uninstall Memcache');
 
     $app->command('tower', function () {
         DevTools::tower();
